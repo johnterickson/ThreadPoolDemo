@@ -44,19 +44,21 @@ static class SyncOverAsyncCop
     ];
 
     public sealed record SyncOverAsyncViolation(
-        int ManagedThreadId,
         string BlockingMethod,
         string AsyncMethod,
-        IReadOnlyList<string> FullStack);
+        int Count,
+        IReadOnlyList<int> ThreadIds,
+        IReadOnlyList<string> ExampleStack);
 
     /// <summary>
     /// Attaches to the current process via ClrMD and walks every managed thread
     /// (except the calling thread) looking for stack frames where a sync-blocking
     /// call sits above an async state-machine MoveNext or continuation frame.
+    /// Results are deduplicated by (BlockingMethod, AsyncMethod).
     /// </summary>
     public static IReadOnlyList<SyncOverAsyncViolation> Detect()
     {
-        var violations = new List<SyncOverAsyncViolation>();
+        var raw = new Dictionary<(string BlockingMethod, string AsyncMethod), (List<int> ThreadIds, List<string> ExampleStack)>();
         int currentManagedThreadId = Environment.CurrentManagedThreadId;
         int pid = Environment.ProcessId;
 
@@ -89,15 +91,29 @@ static class SyncOverAsyncCop
                     string? asyncMatch = MatchesAny(frames[j], s_asyncPatterns);
                     if (asyncMatch is not null)
                     {
-                        violations.Add(new SyncOverAsyncViolation(
-                            thread.ManagedThreadId,
-                            blockingMatch,
-                            frames[j],
-                            frames));
+                        var key = (blockingMatch, frames[j]);
+                        if (!raw.TryGetValue(key, out var entry))
+                        {
+                            entry = (new List<int>(), frames);
+                            raw[key] = entry;
+                        }
+
+                        entry.ThreadIds.Add(thread.ManagedThreadId);
                         break; // one violation per blocking frame is enough
                     }
                 }
             }
+        }
+
+        var violations = new List<SyncOverAsyncViolation>(raw.Count);
+        foreach (var (key, value) in raw)
+        {
+            violations.Add(new SyncOverAsyncViolation(
+                key.BlockingMethod,
+                key.AsyncMethod,
+                value.ThreadIds.Count,
+                value.ThreadIds,
+                value.ExampleStack));
         }
 
         return violations;
@@ -113,18 +129,19 @@ static class SyncOverAsyncCop
             return;
         }
 
-        Console.WriteLine($"[SyncOverAsyncCop] {violations.Count} violation(s) detected:");
+        int totalCount = violations.Sum(v => v.Count);
+        Console.WriteLine($"[SyncOverAsyncCop] {totalCount} violation(s) across {violations.Count} unique pattern(s):");
         Console.WriteLine();
 
         foreach (var v in violations)
         {
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"  Thread {v.ManagedThreadId}: {v.BlockingMethod}");
+            Console.WriteLine($"  {v.BlockingMethod} (x{v.Count}, threads: {string.Join(", ", v.ThreadIds)})");
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine($"    above async frame: {v.AsyncMethod}");
             Console.ResetColor();
-            Console.WriteLine("    Stack:");
-            foreach (var frame in v.FullStack)
+            Console.WriteLine("    Example stack:");
+            foreach (var frame in v.ExampleStack)
             {
                 Console.WriteLine($"      {frame}");
             }
