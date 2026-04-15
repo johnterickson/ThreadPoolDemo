@@ -1,8 +1,149 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using Microsoft.Diagnostics.Runtime;
 
 namespace ThreadPoolDemo;
+
+
+static class SyncOverAsyncCop
+{
+    /// <summary>
+    /// Known method name substrings that indicate a synchronous block.
+    /// </summary>
+    private static readonly string[] s_syncBlockPatterns =
+    [
+        "System.Threading.Monitor.Enter",
+        "System.Threading.Monitor.ReliableEnter",
+        "System.Threading.Monitor.ObjWait",
+        "System.Threading.ManualResetEventSlim.Wait",
+        "System.Threading.SemaphoreSlim.Wait",
+        "System.Threading.Tasks.Task.Wait",
+        "System.Threading.Tasks.Task.InnerWait",
+        "System.Threading.Tasks.Task`1.GetResultCore",       // Task<T>.Result
+        "System.Threading.Tasks.Task.InternalWaitCore",
+        "System.Threading.Tasks.Task+SpinThenBlockingWait",
+        "System.Threading.Thread.Sleep",
+        "System.Threading.WaitHandle.WaitOne",
+        "System.Threading.WaitHandle.WaitAny",
+        "System.Threading.WaitHandle.WaitAll",
+        "System.Threading.CountdownEvent.Wait",
+    ];
+
+    /// <summary>
+    /// Known method name substrings that indicate an async state machine (the
+    /// caller was in an async method).
+    /// </summary>
+    private static readonly string[] s_asyncPatterns =
+    [
+        "MoveNext()",                                         // async state machine entry
+        "System.Runtime.CompilerServices.AsyncTaskMethodBuilder",
+        "System.Runtime.CompilerServices.AsyncVoidMethodBuilder",
+        "System.Threading.Tasks.Task.ContinueWith",
+        "System.Threading.ExecutionContext.RunInternal",
+    ];
+
+    public sealed record SyncOverAsyncViolation(
+        int ManagedThreadId,
+        string BlockingMethod,
+        string AsyncMethod,
+        IReadOnlyList<string> FullStack);
+
+    /// <summary>
+    /// Attaches to the current process via ClrMD and walks every managed thread
+    /// (except the calling thread) looking for stack frames where a sync-blocking
+    /// call sits above an async state-machine MoveNext or continuation frame.
+    /// </summary>
+    public static IReadOnlyList<SyncOverAsyncViolation> Detect()
+    {
+        var violations = new List<SyncOverAsyncViolation>();
+        int currentManagedThreadId = Environment.CurrentManagedThreadId;
+        int pid = Environment.ProcessId;
+
+        using DataTarget dataTarget = DataTarget.AttachToProcess(pid, suspend: false);
+        using ClrRuntime runtime = dataTarget.ClrVersions[0].CreateRuntime();
+
+        foreach (ClrThread thread in runtime.Threads)
+        {
+            if (!thread.IsAlive || thread.ManagedThreadId == currentManagedThreadId)
+                continue;
+
+            var frames = new List<string>();
+            foreach (ClrStackFrame frame in thread.EnumerateStackTrace())
+            {
+                string? name = frame.Method?.Signature;
+                if (name is not null)
+                    frames.Add(name);
+            }
+
+            // Walk top-down: find a sync-blocking frame, then see if any frame
+            // below it is an async frame.
+            for (int i = 0; i < frames.Count; i++)
+            {
+                string? blockingMatch = MatchesAny(frames[i], s_syncBlockPatterns);
+                if (blockingMatch is null)
+                    continue;
+
+                for (int j = i + 1; j < frames.Count; j++)
+                {
+                    string? asyncMatch = MatchesAny(frames[j], s_asyncPatterns);
+                    if (asyncMatch is not null)
+                    {
+                        violations.Add(new SyncOverAsyncViolation(
+                            thread.ManagedThreadId,
+                            blockingMatch,
+                            frames[j],
+                            frames));
+                        break; // one violation per blocking frame is enough
+                    }
+                }
+            }
+        }
+
+        return violations;
+    }
+
+    public static void DetectAndPrint()
+    {
+        var violations = Detect();
+
+        if (violations.Count == 0)
+        {
+            Console.WriteLine("[SyncOverAsyncCop] No sync-over-async violations detected.");
+            return;
+        }
+
+        Console.WriteLine($"[SyncOverAsyncCop] {violations.Count} violation(s) detected:");
+        Console.WriteLine();
+
+        foreach (var v in violations)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"  Thread {v.ManagedThreadId}: {v.BlockingMethod}");
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"    above async frame: {v.AsyncMethod}");
+            Console.ResetColor();
+            Console.WriteLine("    Stack:");
+            foreach (var frame in v.FullStack)
+            {
+                Console.WriteLine($"      {frame}");
+            }
+
+            Console.WriteLine();
+        }
+    }
+
+    private static string? MatchesAny(string frame, string[] patterns)
+    {
+        foreach (string pattern in patterns)
+        {
+            if (frame.Contains(pattern, StringComparison.Ordinal))
+                return pattern;
+        }
+
+        return null;
+    }
+}
 
 internal static class Program
 {
@@ -12,6 +153,15 @@ internal static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        new Thread(() => 
+        {
+            while(true)
+            {
+                SyncOverAsyncCop.DetectAndPrint();
+                Thread.Sleep(1000);
+            }
+        }).Start();
+
         DemoOptions options;
 
         try
