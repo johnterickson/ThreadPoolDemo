@@ -6,7 +6,8 @@ namespace ThreadPoolDemo;
 
 internal static class Program
 {
-    private static int s_completedBuildNodes;
+    private static int s_buildNodesRemaining;
+    private static int s_analysisNodesRemaining;
     private static int s_peakCompletedBuildNodesWaiting;
 
     public static async Task<int> Main(string[] args)
@@ -37,70 +38,48 @@ internal static class Program
     private static void PrintHeader(DemoOptions options)
     {
         Console.WriteLine($"Mode: {options.Mode}");
-        Console.WriteLine($"Sign work mode: {options.WorkMode}");
         Console.WriteLine($"Sign nodes: {options.SignNodes:N0}");
         Console.WriteLine($"Files per sign node: {options.FilesPerSignNode:N0}");
         Console.WriteLine($"Build nodes: {options.BuildNodes:N0}");
         Console.WriteLine($"Sign work per file: {options.SignWorkMilliseconds} ms");
-        Console.WriteLine($"Build completion range: {options.BuildMinDelayMilliseconds}-{options.BuildMaxDelayMilliseconds} ms");
-        Console.WriteLine($"Build start offset: {options.BuildLaunchDelayMilliseconds} ms after sign launch");
-
-        if (options.Mode is DemoMode.Pfea)
-        {
-            Console.WriteLine($"PFEA per-sign-node dop: {options.PfeaDegreeOfParallelism}");
-            Console.WriteLine($"Theoretical sign concurrency cap: {options.SignNodes * options.PfeaDegreeOfParallelism:N0}");
-        }
-        else
-        {
-            Console.WriteLine($"Global semaphore limit: {options.GlobalSemaphoreLimit:N0}");
-        }
-
+        Console.WriteLine($"Build completion range: {options.BuildWorkMilliseconds} ms");
         Console.WriteLine();
     }
 
     private static async Task<ScenarioResult> RunScenarioAsync(DemoOptions options)
     {
-        s_completedBuildNodes = 0;
+        s_buildNodesRemaining = options.BuildNodes;
+        s_analysisNodesRemaining = options.BuildNodes / 2;
         s_peakCompletedBuildNodesWaiting = 0;
 
         var stopwatch = Stopwatch.StartNew();
         var buildContinuationDelays = new ConcurrentBag<double>();
-        Task[] signTasks;
-        SemaphoreSlim? globalSemaphore = null;
 
-        if (options.Mode is DemoMode.Pfea)
-        {
-            signTasks = Enumerable.Range(0, options.SignNodes)
-                .Select(index => Task.Run(() => RunSignNodeWithParallelForEachAsync(index, options)))
-                .ToArray();
-        }
-        else
-        {
-            globalSemaphore = new SemaphoreSlim(options.GlobalSemaphoreLimit, options.GlobalSemaphoreLimit);
-            signTasks = Enumerable.Range(0, options.SignNodes)
-                .Select(index => Task.Run(() => RunSignNodeWithGlobalSemaphoreAsync(index, options, globalSemaphore)))
-                .ToArray();
-        }
+        await Task.Run(async () => {
+            Task[] buildTasks = new Task[options.BuildNodes];
+            Task[] analysisTasks = new Task[options.BuildNodes / 2];
+            Task[] signTasks = new Task[options.SignNodes];
+            int offset = 0;
+            for (int i = 0; i < options.BuildNodes; i++)
+            {
+                buildTasks[i] = RunBuildNodeAsync(i, options, buildContinuationDelays, offset);
+                offset += 10;
+            }
 
-        if (options.BuildLaunchDelayMilliseconds > 0)
-        {
-            Thread.Sleep(options.BuildLaunchDelayMilliseconds);
-        }
+            for (int i = 0; i < options.BuildNodes / 2; i++)
+            {
+                analysisTasks[i] = RunAnalysisNodeAsync(i, options, buildContinuationDelays, offset);
+                offset += 30;
+            }
 
-        using var completionScheduler = new BuildCompletionScheduler(options);
+            for (int i = 0; i < options.SignNodes; i++)
+            {
+                signTasks[i] = RunSignNode(i, options);
+            }
 
-        var buildTasks = Enumerable.Range(0, options.BuildNodes)
-            .Select(index => RunBuildNodeAsync(index, options, completionScheduler, buildContinuationDelays))
-            .ToArray();
-
-        try
-        {
             await Task.WhenAll(signTasks.Concat(buildTasks));
-        }
-        finally
-        {
-            globalSemaphore?.Dispose();
-        }
+        });
+
 
         stopwatch.Stop();
 
@@ -110,128 +89,69 @@ internal static class Program
             BuildSummary.FromOvershoots(buildContinuationDelays));
     }
 
-    private static Task RunSignNodeWithParallelForEachAsync(int signNodeIndex, DemoOptions options)
+    static async Task RunSignNode(int signNodeIndex, DemoOptions options)
     {
-        return Parallel.ForEachAsync(
-            Enumerable.Range(0, options.FilesPerSignNode),
-            new ParallelOptions
-            {
-                MaxDegreeOfParallelism = options.PfeaDegreeOfParallelism,
-            },
-            (fileIndex, cancellationToken) =>
-            {
-                ExecuteSignWork(signNodeIndex, fileIndex, options, cancellationToken);
-                return ValueTask.CompletedTask;
-            });
+        Task[] tasks = new Task[options.FilesPerSignNode];
+        for (int i = 0; i < options.FilesPerSignNode; i++)
+        {
+            tasks[i] = ExecuteSignWorkAsync(options);
+        }
+
+        await Task.WhenAll(tasks);
+        Console.WriteLine($"\x1b[34mSign node {signNodeIndex} end\x1b[0m");
     }
 
-    private static async Task RunSignNodeWithGlobalSemaphoreAsync(
-        int signNodeIndex,
-        DemoOptions options,
-        SemaphoreSlim globalSemaphore)
+    static async Task ExecuteSignWorkAsync(DemoOptions options)
     {
-        for (var fileIndex = 0; fileIndex < options.FilesPerSignNode; fileIndex++)
+        if (options.Mode == DemoMode.GlobalQueue)
         {
-            await globalSemaphore.WaitAsync();
-
-            try
-            {
-                await Task.Run(
-                    () => ExecuteSignWork(signNodeIndex, fileIndex, options, CancellationToken.None));
-            }
-            finally
-            {
-                globalSemaphore.Release();
-            }
+            await Task.Yield();
+            Thread.Sleep(options.SignWorkMilliseconds);
+        }
+        else
+        {
+            await Task.Run(() => { Thread.Sleep(options.SignWorkMilliseconds); });
         }
     }
 
     private static async Task RunBuildNodeAsync(
         int buildNodeIndex,
         DemoOptions options,
-        BuildCompletionScheduler completionScheduler,
-        ConcurrentBag<double> buildContinuationDelays)
+        ConcurrentBag<double> buildContinuationDelays,
+        int offset)
     {
-        var completionDelayMilliseconds = GetBuildDelayMilliseconds(buildNodeIndex, options);
-        var completionSource = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Console.WriteLine($"Build node {buildNodeIndex} start");
+        Stopwatch sw = Stopwatch.StartNew();
 
-        completionScheduler.Schedule(completionDelayMilliseconds, completionSource);
+        await Task.Delay(options.BuildWorkMilliseconds + offset);
+        Console.WriteLine($"\x1b[32mBuild node {buildNodeIndex} end\x1b[0m");
 
-        var completionTimestamp = await completionSource.Task;
-        var continuationTimestamp = Stopwatch.GetTimestamp();
-        var continuationDelayMilliseconds = Math.Max(
-            0,
-            StopwatchTicksToMilliseconds(continuationTimestamp - completionTimestamp));
-
-        Interlocked.Decrement(ref s_completedBuildNodes);
-        buildContinuationDelays.Add(continuationDelayMilliseconds);
-    }
-
-    private static int GetBuildDelayMilliseconds(int buildNodeIndex, DemoOptions options)
-    {
-        var range = options.BuildMaxDelayMilliseconds - options.BuildMinDelayMilliseconds;
-
-        if (range <= 0)
+        if (Interlocked.Decrement(ref s_buildNodesRemaining) == 0)
         {
-            return options.BuildMinDelayMilliseconds;
+            Console.WriteLine($"\x1b[32m------------------------------------BUILD DONE------------------------------------\x1b[0m");
         }
 
-        return options.BuildMinDelayMilliseconds + (buildNodeIndex % (range + 1));
+        buildContinuationDelays.Add(sw.ElapsedMilliseconds - (options.BuildWorkMilliseconds + offset));
     }
 
-    private static void ExecuteSignWork(
-        int signNodeIndex,
-        int fileIndex,
+    private static async Task RunAnalysisNodeAsync(
+        int buildNodeIndex,
         DemoOptions options,
-        CancellationToken cancellationToken)
+        ConcurrentBag<double> buildContinuationDelays,
+        int offset)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        // Console.WriteLine($"Build node {buildNodeIndex} start");
+        Stopwatch sw = Stopwatch.StartNew();
 
-        if (options.WorkMode is SignWorkMode.Sleep)
+        await Task.Delay(0 + offset);
+        Console.WriteLine($"\x1b[33mAnalysis node {buildNodeIndex} end\x1b[0m");
+
+        if (Interlocked.Decrement(ref s_analysisNodesRemaining) == 0)
         {
-            Thread.Sleep(options.SignWorkMilliseconds);
-            return;
+            Console.WriteLine($"\x1b[33m------------------------------------ANALYSIS DONE------------------------------------\x1b[0m");
         }
 
-        var deadline = Stopwatch.GetTimestamp() + MillisecondsToStopwatchTicks(options.SignWorkMilliseconds);
-        var hash = (signNodeIndex + 1) * 397 ^ fileIndex;
-
-        while (Stopwatch.GetTimestamp() < deadline)
-        {
-            hash = unchecked((hash * 16777619) ^ Environment.ProcessorCount);
-        }
-
-        GC.KeepAlive(hash);
-    }
-
-    private static long MillisecondsToStopwatchTicks(int milliseconds)
-    {
-        return (long)Math.Round(milliseconds * Stopwatch.Frequency / 1000.0);
-    }
-
-    private static double StopwatchTicksToMilliseconds(long ticks)
-    {
-        return ticks * 1000.0 / Stopwatch.Frequency;
-    }
-
-    private static void ObserveCompletedBuildNode()
-    {
-        var completed = Interlocked.Increment(ref s_completedBuildNodes);
-
-        while (true)
-        {
-            var currentPeak = Volatile.Read(ref s_peakCompletedBuildNodesWaiting);
-
-            if (completed <= currentPeak)
-            {
-                return;
-            }
-
-            if (Interlocked.CompareExchange(ref s_peakCompletedBuildNodesWaiting, completed, currentPeak) == currentPeak)
-            {
-                return;
-            }
-        }
+        buildContinuationDelays.Add(sw.ElapsedMilliseconds - (0 + offset));
     }
 
     private static void PrintSummary(DemoOptions options, ScenarioResult result, RuntimeMetrics metrics)
@@ -240,22 +160,11 @@ internal static class Program
         Console.WriteLine($"Elapsed: {result.Elapsed.TotalSeconds:F2} s");
         Console.WriteLine($"Peak process threads: {metrics.PeakProcessThreadCount:N0}");
         Console.WriteLine($"Peak ThreadPool threads: {metrics.PeakThreadPoolThreadCount:N0}");
-        Console.WriteLine($"Peak pending work items: {metrics.PeakPendingWorkItems:N0}");
-        Console.WriteLine($"Peak completed build nodes waiting for continuations: {result.PeakCompletedBuildNodesWaiting:N0}");
         Console.WriteLine($"Build continuation delay p50: {result.BuildSummary.P50Milliseconds:F2} ms");
         Console.WriteLine($"Build continuation delay p95: {result.BuildSummary.P95Milliseconds:F2} ms");
         Console.WriteLine($"Build continuation delay p99: {result.BuildSummary.P99Milliseconds:F2} ms");
         Console.WriteLine($"Build continuation delay max: {result.BuildSummary.MaxMilliseconds:F2} ms");
         Console.WriteLine();
-
-        if (options.Mode is DemoMode.Pfea)
-        {
-            Console.WriteLine("Interpretation: larger continuation delay here means build nodes completed, but their continuations ran later because sign work had already flooded the scheduler.");
-        }
-        else
-        {
-            Console.WriteLine("Interpretation: lower continuation delay here means the shared semaphore kept much less sign work active at the same time.");
-        }
     }
 
     private sealed record ScenarioResult(
@@ -291,92 +200,6 @@ internal static class Program
             index = Math.Clamp(index, 0, sortedValues.Length - 1);
             return sortedValues[index];
         }
-    }
-
-    private sealed class BuildCompletionScheduler : IDisposable
-    {
-        private readonly AutoResetEvent _signal = new(false);
-        private readonly CancellationTokenSource _cts = new();
-        private readonly PriorityQueue<ScheduledCompletion, long> _queue = new();
-        private readonly object _lock = new();
-        private readonly Thread _thread;
-
-        public BuildCompletionScheduler(DemoOptions options)
-        {
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "build-completion-scheduler",
-                Priority = ThreadPriority.Highest,
-            };
-
-            _thread.Start();
-        }
-
-        public void Schedule(int delayMilliseconds, TaskCompletionSource<long> completionSource)
-        {
-            var dueTimestamp = Stopwatch.GetTimestamp() + MillisecondsToStopwatchTicks(delayMilliseconds);
-
-            lock (_lock)
-            {
-                _queue.Enqueue(new ScheduledCompletion(dueTimestamp, completionSource), dueTimestamp);
-            }
-
-            _signal.Set();
-        }
-
-        public void Dispose()
-        {
-            _cts.Cancel();
-            _signal.Set();
-            _thread.Join();
-            _signal.Dispose();
-            _cts.Dispose();
-        }
-
-        private void Run()
-        {
-            while (!_cts.IsCancellationRequested)
-            {
-                ScheduledCompletion? next;
-
-                lock (_lock)
-                {
-                    next = _queue.Count > 0 ? _queue.Peek() : null;
-                }
-
-                if (next is null)
-                {
-                    _signal.WaitOne(50);
-                    continue;
-                }
-
-                var remainingTicks = next.DueTimestamp - Stopwatch.GetTimestamp();
-
-                if (remainingTicks > 0)
-                {
-                    var remainingMilliseconds = Math.Max(1, (int)Math.Min(int.MaxValue, StopwatchTicksToMilliseconds(remainingTicks)));
-                    _signal.WaitOne(remainingMilliseconds);
-                    continue;
-                }
-
-                lock (_lock)
-                {
-                    if (_queue.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    next = _queue.Dequeue();
-                }
-
-                var completionTimestamp = Stopwatch.GetTimestamp();
-                ObserveCompletedBuildNode();
-                next.CompletionSource.SetResult(completionTimestamp);
-            }
-        }
-
-        private sealed record ScheduledCompletion(long DueTimestamp, TaskCompletionSource<long> CompletionSource);
     }
 
     private sealed class MetricsSampler : IDisposable
@@ -433,16 +256,11 @@ internal static class Program
 
     private sealed record DemoOptions(
         DemoMode Mode,
-        SignWorkMode WorkMode,
         int SignNodes,
         int FilesPerSignNode,
         int BuildNodes,
         int SignWorkMilliseconds,
-        int BuildMinDelayMilliseconds,
-        int BuildMaxDelayMilliseconds,
-        int PfeaDegreeOfParallelism,
-        int GlobalSemaphoreLimit,
-        int BuildLaunchDelayMilliseconds)
+        int BuildWorkMilliseconds)
     {
         public static DemoOptions Parse(string[] args)
         {
@@ -466,22 +284,12 @@ internal static class Program
             }
 
             var options = new DemoOptions(
-                ParseEnum(values, "mode", DemoMode.Pfea),
-                ParseEnum(values, "work-mode", SignWorkMode.Sleep),
+                ParseEnum(values, "mode", DemoMode.GlobalQueue),
                 ParsePositiveInt(values, "sign-nodes", 192),
                 ParsePositiveInt(values, "files-per-sign", 512),
                 ParsePositiveInt(values, "build-nodes", 512),
                 ParsePositiveInt(values, "sign-ms", 3),
-                ParseNonNegativeInt(values, "build-min-ms", 50),
-                ParseNonNegativeInt(values, "build-max-ms", 250),
-                ParsePositiveInt(values, "pfea-dop", 8),
-                ParsePositiveInt(values, "global-limit", 32),
-                ParseNonNegativeInt(values, "build-launch-delay-ms", 100));
-
-            if (options.BuildMaxDelayMilliseconds < options.BuildMinDelayMilliseconds)
-            {
-                throw new ArgumentException("--build-max-ms must be greater than or equal to --build-min-ms.");
-            }
+                ParseNonNegativeInt(values, "build-ms", 50));
 
             return options;
         }
@@ -489,21 +297,16 @@ internal static class Program
         public static void PrintUsage()
         {
             Console.WriteLine("Usage:");
-            Console.WriteLine("  dotnet run -c Release --project ThreadPoolDemo -- --mode=pfea");
-            Console.WriteLine("  dotnet run -c Release --project ThreadPoolDemo -- --mode=semaphore");
+            Console.WriteLine("  dotnet run -c Release --project ThreadPoolDemo -- --mode=localqueue");
+            Console.WriteLine("  dotnet run -c Release --project ThreadPoolDemo -- --mode=globalqueue");
             Console.WriteLine();
             Console.WriteLine("Options:");
-            Console.WriteLine("  --mode=pfea|semaphore");
-            Console.WriteLine("  --work-mode=sleep|spin");
+            Console.WriteLine("  --mode=localqueue|globalqueue");
             Console.WriteLine("  --sign-nodes=<int>");
             Console.WriteLine("  --files-per-sign=<int>");
             Console.WriteLine("  --build-nodes=<int>");
             Console.WriteLine("  --sign-ms=<int>");
-            Console.WriteLine("  --build-min-ms=<int>");
-            Console.WriteLine("  --build-max-ms=<int>");
-            Console.WriteLine("  --pfea-dop=<int>");
-            Console.WriteLine("  --global-limit=<int>");
-            Console.WriteLine("  --build-launch-delay-ms=<int>");
+            Console.WriteLine("  --build-ms=<int>");
         }
 
         private static int ParsePositiveInt(IDictionary<string, string> values, string name, int defaultValue)
@@ -555,13 +358,7 @@ internal static class Program
 
     private enum DemoMode
     {
-        Pfea,
-        Semaphore,
-    }
-
-    private enum SignWorkMode
-    {
-        Sleep,
-        Spin,
+        GlobalQueue,
+        LocalQueue,
     }
 }

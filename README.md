@@ -1,83 +1,38 @@
-# ThreadPool Demo
+This is a demo of local vs global thread pool task queues and how they can impact task completion.
 
-This repo contains a `net9.0` console app that demonstrates delayed `Task` continuations under heavy sign-node fan-out.
+The only difference between these two demos is a one-liner calling `Task.Run()` vs `Task.Yield()`.
 
-The demo models two kinds of build-engine nodes:
-
-- `sign` nodes: many nodes start first, each one processes many file items.
-- `build` nodes: simple completion tasks with no internal parallelism.
-
-The comparison is between these two sign-node implementations:
-
-- `pfea`: each sign node uses `Parallel.ForEachAsync(..., MaxDegreeOfParallelism = 8)`.
-- `semaphore`: each sign node uses a single shared global `SemaphoreSlim` and `WaitAsync()` before doing the same work.
-
-The sign work is intentionally synchronous and blocking by default via `Thread.Sleep(...)` so the runtime has a reason to create many worker threads, closer to the real-world behavior being modeled.
-
-## Build
-
-```powershell
+```
 dotnet build ThreadPoolDemo -c Release
 ```
 
-## Run
+`--mode=localqueue`: queues Sign node tasks onto thread-local task queues via `Task.Run()`.
+You'll see each Build and Analysis nodes complete as soon as they're ready.
 
-Default `Parallel.ForEachAsync` scenario:
-
-```powershell
-dotnet run -c Release --project ThreadPoolDemo -- --mode=pfea
+```
+dotnet build ThreadPoolDemo -c Release && dotnet ".\ThreadPoolDemo\bin\Release\net9.0\ThreadPoolDemo.dll" --mode=localqueue --build-nodes=150 --sign-nodes=150 --sign-ms=50 --files-per-sign=50 --build-ms=2000 --build-max-ms=1000
 ```
 
-Counter-example with a shared semaphore:
-
-```powershell
-dotnet run -c Release --project ThreadPoolDemo -- --mode=semaphore
+```
+Build continuation delay p50: 18.00 ms
+Build continuation delay p95: 53.00 ms
+Build continuation delay p99: 60.00 ms
+Build continuation delay max: 61.00 ms
 ```
 
-Useful larger run that tends to create a much bigger backlog:
+`--mode=globalqueue`: queues Sign node tasks onto the global task queue via `Task.Yield()`.
+You'll see progress at first until the global queue exceeds the completion rate, after which all tasks will appear to get stuck until the global queue is fully drained.
 
-```powershell
-dotnet run -c Release --project ThreadPoolDemo -- --mode=pfea --sign-nodes=256 --files-per-sign=1024 --build-nodes=1024 --sign-ms=4 --build-launch-delay-ms=100 --pfea-dop=8
+```
+Run this and watch every task finish at the same time.
+```
+dotnet build ThreadPoolDemo -c Release && dotnet ".\ThreadPoolDemo\bin\Release\net9.0\ThreadPoolDemo.dll" --mode=globalqueue --build-nodes=150 --sign-nodes=150 --sign-ms=50 --files-per-sign=50 --build-ms=2000 --build-max-ms=1000
 ```
 
-Matching semaphore run:
-
-```powershell
-dotnet run -c Release --project ThreadPoolDemo -- --mode=semaphore --sign-nodes=256 --files-per-sign=1024 --build-nodes=1024 --sign-ms=4 --build-launch-delay-ms=100 --global-limit=32
+```
+Build continuation delay p50: 9808.00 ms
+Build continuation delay p95: 10673.00 ms
+Build continuation delay p99: 11038.00 ms
+Build continuation delay max: 11155.00 ms
 ```
 
-## Output
-
-Each run prints:
-
-- elapsed wall-clock time
-- peak process thread count
-- peak `ThreadPool.ThreadCount`
-- peak `ThreadPool.PendingWorkItemCount`
-- peak completed build nodes waiting for continuations
-- build-node continuation delay percentiles (`p50`, `p95`, `p99`, `max`)
-
-Build continuation delay is the main signal for this demo. A dedicated scheduler thread marks build nodes complete at their due time, then the demo measures how much later the `await` continuation actually runs on the thread pool. Higher delay means nodes completed but their continuations resumed late.
-
-## Options
-
-```text
---mode=pfea|semaphore
---work-mode=sleep|spin
---sign-nodes=<int>
---files-per-sign=<int>
---build-nodes=<int>
---sign-ms=<int>
---build-min-ms=<int>
---build-max-ms=<int>
---pfea-dop=<int>
---global-limit=<int>
---build-launch-delay-ms=<int>
-```
-
-Notes:
-
-- startup order is `sign-first`
-- build nodes are armed after the sign nodes have already been launched
-- `sleep` mode is usually better for reproducing large worker-thread growth
-- `spin` mode is available if you want CPU-bound work instead of blocking waits
